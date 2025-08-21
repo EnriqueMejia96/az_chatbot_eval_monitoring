@@ -19,6 +19,9 @@ load_dotenv()
 project_endpoint = os.getenv("PROJECT_ENDPOINT")
 embedding_deployment = os.getenv("EMBEDDING_DEPLOYMENT")
 
+EVAL_ATTACH_TO_CHAT = os.getenv("EVAL_ATTACH_TO_CHAT", "true").lower() in ("1", "true", "yes")
+
+
 if not project_endpoint:
     raise RuntimeError("PROJECT_ENDPOINT must be set as environment variables.")
 
@@ -230,6 +233,23 @@ def _basic_eval(answer_text: str, question_text: str, context_text: str):
     return metrics
 
 # ---------- LLM-judge evaluation (Coherence / Fluency / optional QA) ----------
+
+def _emit_eval_event(active_span, evaluator: str, score: float, model: str, response_id: str):
+    # Emits a trace event that Foundry's KQL will pick up
+    name = f"gen_ai.evaluation.{evaluator}"
+    attrs = {
+        "event.name": name,                         # optional; KQL also falls back to 'message'
+        "gen_ai.evaluation.score": float(score),    # REQUIRED for the chart
+        "gen_ai.evaluator.name": evaluator,         # optional; KQL derives from event name if missing
+        "gen_ai.request.model": model,              # REQUIRED for model filter
+        "gen_ai.response.id": response_id,          # REQUIRED for the join with the inference call
+    }
+    try:
+        active_span.add_event(name, attributes=attrs)
+    except Exception:
+        pass
+
+
 def _llm_eval(question_text: str, answer_text: str, context_text: str, ground_truth: str | None = None):
     results = {}
     if not _HAS_LLM_EVAL:
@@ -287,7 +307,6 @@ def _llm_eval(question_text: str, answer_text: str, context_text: str, ground_tr
     return {k: v for k, v in results.items() if v is not None}
 
 def get_response(model, temperature, messages):
-    # Chat span (SDK span "chat gpt-4o" will appear as a child)
     with tracer.start_as_current_span("chat.completions.create") as span:
         span.set_attribute("session.id", SESSION_ID)
         span.set_attribute("gen_ai.system", "openai")
@@ -298,17 +317,15 @@ def get_response(model, temperature, messages):
         try:
             t0 = time.time()
             completion = chat_client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=messages,
+                model=model, temperature=temperature, messages=messages
             )
             dt_ms = int((time.time() - t0) * 1000)
             span.set_attribute("gen_ai.response.latency_ms", dt_ms)
 
-            if hasattr(completion, "id"):
-                span.set_attribute("gen_ai.response.id", completion.id)
-            if hasattr(completion, "model"):
-                span.set_attribute("gen_ai.response.model", completion.model)
+            resp_id  = getattr(completion, "id", "") or ""
+            resp_mod = getattr(completion, "model", "") or ""
+            if resp_id:  span.set_attribute("gen_ai.response.id", resp_id)
+            if resp_mod: span.set_attribute("gen_ai.response.model", resp_mod)
 
             try:
                 fr = completion.choices[0].finish_reason
@@ -325,35 +342,69 @@ def get_response(model, temperature, messages):
 
             msg = completion.choices[0].message.content
 
+            # ---- attach compact numbers to the chat span (for the table column) ----
+            q = _last_user_message(messages)
+            ctx = _extract_context_from_system(messages)
+            try:
+                basic = _basic_eval(answer_text=msg, question_text=q, context_text="")  # no embed calls here
+                for k in ("ai.evaluation.answer_length", "ai.evaluation.sentences", "ai.evaluation.lexical_diversity"):
+                    if k in basic:
+                        span.set_attribute(k, float(basic[k]))
+            except Exception:
+                pass
+
+            # ---- LLM-judge inside the chat span so we can emit events with this span active ----
+            llm_metrics = {}
+            if _HAS_LLM_EVAL:
+                try:
+                    llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=None)
+
+                    # Put canonical keys on span (helps the column show values)
+                    if "ai.eval.coherence" in llm_metrics:
+                        span.set_attribute("coherence", float(llm_metrics["ai.eval.coherence"]))
+                        _emit_eval_event(span, "coherence", llm_metrics["ai.eval.coherence"],
+                                         model or resp_mod, resp_id)
+                    if "ai.eval.fluency" in llm_metrics:
+                        span.set_attribute("fluency", float(llm_metrics["ai.eval.fluency"]))
+                        _emit_eval_event(span, "fluency", llm_metrics["ai.eval.fluency"],
+                                         model or resp_mod, resp_id)
+                    # Optional QA metrics if you enable them later
+                    if "ai.eval.qa.similarity" in llm_metrics:
+                        span.set_attribute("similarity", float(llm_metrics["ai.eval.qa.similarity"]))
+                        _emit_eval_event(span, "similarity", llm_metrics["ai.eval.qa.similarity"],
+                                         model or resp_mod, resp_id)
+                    if "ai.eval.qa.f1_score" in llm_metrics:
+                        span.set_attribute("f1_score", float(llm_metrics["ai.eval.qa.f1_score"]))
+                        _emit_eval_event(span, "f1_score", llm_metrics["ai.eval.qa.f1_score"],
+                                         model or resp_mod, resp_id)
+                except Exception:
+                    pass
+
         except Exception as e:
             span.set_status(Status(StatusCode.ERROR, str(e)))
             span.record_exception(e)
             raise
 
-    # ---------- Basic evaluator span (sibling) ----------
+    # Sibling spans (keep, optional)
     try:
         with tracer.start_as_current_span("eval.metrics") as eval_span:
             eval_span.set_attribute("session.id", SESSION_ID)
             q = _last_user_message(messages)
             ctx = _extract_context_from_system(messages)
-            metrics = _basic_eval(answer_text=msg, question_text=q, context_text=ctx)
+            metrics = _basic_eval(answer_text=msg, question_text=q, context_text=ctx)  # includes context_similarity
             for k, v in metrics.items():
                 eval_span.set_attribute(k, float(v))
     except Exception:
         pass
 
-    # ---------- LLM-judge evaluator span (sibling) ----------
     if _HAS_LLM_EVAL:
         try:
             with tracer.start_as_current_span("eval.llm") as llm_span:
                 llm_span.set_attribute("session.id", SESSION_ID)
                 q = _last_user_message(messages)
                 ctx = _extract_context_from_system(messages)
-                # If you ever have a ground truth string, pass it here:
-                gt = os.getenv("EVAL_QA_GROUND_TRUTH", None) if EVAL_QA_ENABLE else None
-                llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=gt)
+                llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=None)
                 for k, v in llm_metrics.items():
-                    # numbers set as floats; reasons as strings
                     if isinstance(v, (int, float)):
                         llm_span.set_attribute(k, float(v))
                     else:
@@ -362,3 +413,4 @@ def get_response(model, temperature, messages):
             pass
 
     return msg
+
