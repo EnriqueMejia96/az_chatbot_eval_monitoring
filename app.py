@@ -1,7 +1,7 @@
 import streamlit as st
 from openai import OpenAI
 import pandas as pd
-from utils import get_context_from_query, custom_prompt, get_response
+from utils import get_context_from_query, custom_prompt, get_response, tracer, SESSION_ID
 
 df_vector_store = pd.read_pickle('df_vector_store.pkl')
 
@@ -45,17 +45,27 @@ def main_page():
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
 
-        # Proceed with generating the context and response
-        Context_List = get_context_from_query(query=prompt,
-                                                vector_store=df_vector_store,
-                                                n_chunks=5)
-        messages = [{"role": "system", "content": f"{custom_prompt.format(source=str(Context_List))}"}] + st.session_state.message_history + [{"role": "user", "content": prompt}]
-        
-        full_response = get_response(model=st.session_state.model, 
-                                    temperature=st.session_state.temperature, 
-                                    messages=messages)
+        with tracer.start_as_current_span("rag.qa") as root:
+            root.set_attribute("session.id", SESSION_ID)
+            root.set_attribute("gen_ai.use_case", "rag_qa")
+
+            Context_List = get_context_from_query(
+                query=prompt,
+                vector_store=df_vector_store,
+                n_chunks=5
+            )
+            messages = [{"role": "system", "content": f"{custom_prompt.format(source=str(Context_List))}"}] \
+                      + st.session_state.message_history \
+                      + [{"role": "user", "content": prompt}]
+
+            full_response = get_response(
+                model=st.session_state.model,
+                temperature=st.session_state.temperature,
+                messages=messages
+            )
 
         message_placeholder.markdown(full_response)
+
     st.session_state.message_history.append({"role": "user", "content": prompt})
     st.session_state.message_history.append({"role": "assistant", "content": full_response})
     st.session_state.generar_pressed = True

@@ -2,7 +2,8 @@ streamlit==1.36.0
 pandas
 numpy
 python-dotenv
-openai azure-identity 
+openai 
+azure-identity 
 azure-ai-projects 
 opentelemetry-instrumentation-openai-v2 
 azure-monitor-opentelemetry
