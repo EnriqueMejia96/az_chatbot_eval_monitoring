@@ -1,6 +1,7 @@
 import os
 import uuid
 import time
+import re
 import numpy as np
 from dotenv import load_dotenv
 from urllib.parse import urlparse
@@ -25,6 +26,11 @@ if not project_endpoint:
 os.environ.setdefault("OTEL_SERVICE_NAME", "rag-app")
 os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
 
+# Toggle extra eval embedding calls (answer vs. context similarity)
+EVAL_CONTEXT_SIM = os.getenv("EVAL_CONTEXT_SIMILARITY", "true").lower() in ("1", "true", "yes")
+EVAL_THRESHOLD = int(os.getenv("EVAL_THRESHOLD", "3"))
+EVAL_QA_ENABLE = os.getenv("EVAL_QA_ENABLE", "false").lower() in ("1", "true", "yes")
+
 # ---------- OpenTelemetry ----------
 tracer = trace.get_tracer(__name__)
 SESSION_ID = str(uuid.uuid4())
@@ -33,7 +39,6 @@ SESSION_ID = str(uuid.uuid4())
 _server_host = urlparse(project_endpoint).hostname or ""
 
 # ---------- Azure AI Project & Observability ----------
-# Allow both Env creds (e.g., local dev with AZURE_* vars) and Managed Identity in App Service.
 credential = DefaultAzureCredential(
     exclude_environment_credential=False,
     exclude_managed_identity_credential=False,
@@ -48,15 +53,12 @@ project_client = AIProjectClient(
     endpoint=project_endpoint,
 )
 
-# Wire up Azure Monitor automatically (Application Insights is behind the project)
 ai_conn = project_client.telemetry.get_application_insights_connection_string()
 if not ai_conn:
     raise RuntimeError("No App Insights connected to this Project – configure it in the portal (Tracing).")
-print("AppInsights conn str present:", bool(ai_conn))
 configure_azure_monitor(connection_string=ai_conn)
 
-
-# Optional: also export traces to console (useful for CI). Enable with OTEL_TRACE_TO_CONSOLE=true
+# Optional: export traces to console (useful in CI)
 if os.getenv("OTEL_TRACE_TO_CONSOLE", "false").lower() in ("1", "true", "yes"):
     try:
         from opentelemetry import trace as trace_api
@@ -65,7 +67,6 @@ if os.getenv("OTEL_TRACE_TO_CONSOLE", "false").lower() in ("1", "true", "yes"):
         if hasattr(provider, "add_span_processor"):
             provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
     except Exception:
-        # Don't fail app if console exporter can't be attached
         pass
 
 # Instrument OpenAI-compatible client
@@ -74,12 +75,49 @@ OpenAIInstrumentor().instrument()
 # OpenAI-compatible client from the Project
 chat_client = project_client.get_openai_client(api_version="2024-10-21")
 
-# ---------- Your original helpers (kept intact API) ----------
+# ---------- Optional LLM-judge evaluators (Coherence, Fluency, QA) ----------
+_HAS_LLM_EVAL = False
+try:
+    from azure.ai.evaluation import (
+        AzureOpenAIModelConfiguration,
+        CoherenceEvaluator,
+        FluencyEvaluator,
+        QAEvaluator,
+    )
+
+    # Use the same env var names as the docs (you can also set JUDGE_* variants if you prefer)
+    JUDGE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+    JUDGE_API_KEY = os.getenv("AZURE_API_KEY")
+    JUDGE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT_NAME")
+    JUDGE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-10-21")
+
+    if JUDGE_ENDPOINT and JUDGE_API_KEY and JUDGE_DEPLOYMENT:
+        _model_config = AzureOpenAIModelConfiguration(
+            azure_endpoint=JUDGE_ENDPOINT,
+            api_key=JUDGE_API_KEY,
+            azure_deployment=JUDGE_DEPLOYMENT,
+            api_version=JUDGE_API_VERSION,
+        )
+        _coherence_eval = CoherenceEvaluator(model_config=_model_config, threshold=EVAL_THRESHOLD)
+        _fluency_eval = FluencyEvaluator(model_config=_model_config, threshold=EVAL_THRESHOLD)
+        # QA evaluator will be created lazily only if used
+        _HAS_LLM_EVAL = True
+    else:
+        _model_config = None
+        _coherence_eval = None
+        _fluency_eval = None
+except Exception:
+    _model_config = None
+    _coherence_eval = None
+    _fluency_eval = None
+    _HAS_LLM_EVAL = False
+
+# ---------- Your original helpers (same API) ----------
 def text_embedding(text=[]):
     # Trace-only: richer span name & attrs; no logic change
     with tracer.start_as_current_span("embeddings.create") as span:
         span.set_attribute("session.id", SESSION_ID)
-        span.set_attribute("gen_ai.system", "openai")  # per doc examples
+        span.set_attribute("gen_ai.system", "openai")
         span.set_attribute("gen_ai.operation.name", "embedding")
         span.set_attribute("gen_ai.request.model", embedding_deployment)
         span.set_attribute("server.address", _server_host)
@@ -96,7 +134,6 @@ def text_embedding(text=[]):
             emb = resp.data[0].embedding
             span.set_attribute("embedding.dimension", len(emb))
 
-            # Response metadata if available
             if hasattr(resp, "id"):
                 span.set_attribute("gen_ai.response.id", resp.id)
             if hasattr(resp, "model"):
@@ -152,12 +189,109 @@ RESULTADOS DE BÚSQUEDA SEMANTICA:
 Lee cuidadosamente las instrucciones, respira profundo y escribe una respuesta para el usuario!
 """
 
+# ---------- Basic evaluation (numeric attributes show in tracing) ----------
+def _last_user_message(messages):
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return m.get("content", "")
+    return ""
+
+def _extract_context_from_system(messages):
+    if not messages:
+        return ""
+    sys = messages[0].get("content", "") if messages[0].get("role") == "system" else ""
+    if not sys:
+        return ""
+    m = re.search(r"RESULTADOS DE BÚSQUEDA SEM[ÁA]NTICA:\s*(.+?)\n\s*Lee cuidadosamente", sys, flags=re.S)
+    return m.group(1).strip() if m else ""
+
+def _basic_eval(answer_text: str, question_text: str, context_text: str):
+    words = re.findall(r"\w+", answer_text, flags=re.UNICODE)
+    length = len(answer_text)
+    sentences = sum(answer_text.count(x) for x in [".", "!", "?"])
+    lex_div = (len(set(w.lower() for w in words)) / max(1, len(words))) if words else 0.0
+
+    metrics = {
+        "ai.evaluation.answer_length": float(length),
+        "ai.evaluation.sentences": float(sentences),
+        "ai.evaluation.lexical_diversity": float(lex_div),
+    }
+
+    if EVAL_CONTEXT_SIM and context_text:
+        try:
+            a_vec = np.array(text_embedding(answer_text), dtype=np.float32)
+            c_vec = np.array(text_embedding(context_text), dtype=np.float32)
+            denom = (np.linalg.norm(a_vec) * np.linalg.norm(c_vec)) or 1.0
+            sim = float(np.dot(a_vec, c_vec) / denom)
+            metrics["ai.evaluation.context_similarity"] = sim
+        except Exception:
+            pass
+
+    return metrics
+
+# ---------- LLM-judge evaluation (Coherence / Fluency / optional QA) ----------
+def _llm_eval(question_text: str, answer_text: str, context_text: str, ground_truth: str | None = None):
+    results = {}
+    if not _HAS_LLM_EVAL:
+        return results
+
+    # Coherence
+    try:
+        # Coherence accepts (query, response); both help the judge
+        coh = _coherence_eval(query=question_text, response=answer_text)
+        # Likert scores are numeric (1..5); pass/fail is string
+        results["ai.eval.coherence"] = float(coh.get("coherence")) if "coherence" in coh else None
+        results["ai.eval.coherence_pass"] = 1.0 if str(coh.get("coherence_result", "")).lower() == "pass" else 0.0
+        # reasons as strings (visible in span details)
+        if "coherence_reason" in coh:
+            results["ai.eval.coherence_reason"] = str(coh["coherence_reason"])
+    except Exception:
+        pass
+
+    # Fluency
+    try:
+        flu = _fluency_eval(response=answer_text)
+        results["ai.eval.fluency"] = float(flu.get("fluency")) if "fluency" in flu else None
+        results["ai.eval.fluency_pass"] = 1.0 if str(flu.get("fluency_result", "")).lower() == "pass" else 0.0
+        if "fluency_reason" in flu:
+            results["ai.eval.fluency_reason"] = str(flu["fluency_reason"])
+    except Exception:
+        pass
+
+    # QA (optional; requires ground truth)
+    if EVAL_QA_ENABLE and ground_truth:
+        try:
+            qa_eval = QAEvaluator(model_config=_model_config, threshold=EVAL_THRESHOLD)
+            qa = qa_eval(
+                query=question_text,
+                context=context_text or "",
+                response=answer_text,
+                ground_truth=ground_truth,
+            )
+            # numeric fields
+            for k in ("f1_score", "similarity", "fluency", "relevance", "coherence", "groundedness"):
+                if k in qa and qa[k] is not None:
+                    results[f"ai.eval.qa.{k}"] = float(qa[k])
+            # pass/fail to 0/1
+            for rk in ("f1_result", "similarity_result", "fluency_result", "relevance_result",
+                       "coherence_result", "groundedness_result"):
+                if rk in qa:
+                    results[f"ai.eval.qa.{rk.replace('_result','_pass')}"] = 1.0 if str(qa[rk]).lower() == "pass" else 0.0
+            # include one reason if present
+            for rk in ("fluency_reason", "relevance_reason", "coherence_reason", "groundedness_reason"):
+                if rk in qa:
+                    results[f"ai.eval.qa.{rk}"] = str(qa[rk])
+        except Exception:
+            pass
+
+    return {k: v for k, v in results.items() if v is not None}
+
 def get_response(model, temperature, messages):
-    # Trace-only: add standard GenAI attrs and token/response metadata; no logic change
+    # Chat span (SDK span "chat gpt-4o" will appear as a child)
     with tracer.start_as_current_span("chat.completions.create") as span:
         span.set_attribute("session.id", SESSION_ID)
-        span.set_attribute("gen_ai.system", "openai")  # per doc examples
-        span.set_attribute("gen_ai.operation.name", "chat")  # align with docs
+        span.set_attribute("gen_ai.system", "openai")
+        span.set_attribute("gen_ai.operation.name", "chat")
         span.set_attribute("gen_ai.request.model", model)
         span.set_attribute("gen_ai.request.temperature", float(temperature))
         span.set_attribute("server.address", _server_host)
@@ -171,13 +305,11 @@ def get_response(model, temperature, messages):
             dt_ms = int((time.time() - t0) * 1000)
             span.set_attribute("gen_ai.response.latency_ms", dt_ms)
 
-            # Response metadata (if exposed by SDK)
             if hasattr(completion, "id"):
                 span.set_attribute("gen_ai.response.id", completion.id)
             if hasattr(completion, "model"):
                 span.set_attribute("gen_ai.response.model", completion.model)
 
-            # Finish reason (first choice)
             try:
                 fr = completion.choices[0].finish_reason
                 if fr is not None:
@@ -185,15 +317,48 @@ def get_response(model, temperature, messages):
             except Exception:
                 pass
 
-            # Capture usage if provided by SDK
             usage = getattr(completion, "usage", None)
             if usage:
                 span.set_attribute("gen_ai.usage.input_tokens", getattr(usage, "prompt_tokens", 0) or 0)
                 span.set_attribute("gen_ai.usage.output_tokens", getattr(usage, "completion_tokens", 0) or 0)
                 span.set_attribute("gen_ai.usage.total_tokens", getattr(usage, "total_tokens", 0) or 0)
 
-            return completion.choices[0].message.content
+            msg = completion.choices[0].message.content
+
         except Exception as e:
             span.set_status(Status(StatusCode.ERROR, str(e)))
             span.record_exception(e)
             raise
+
+    # ---------- Basic evaluator span (sibling) ----------
+    try:
+        with tracer.start_as_current_span("eval.metrics") as eval_span:
+            eval_span.set_attribute("session.id", SESSION_ID)
+            q = _last_user_message(messages)
+            ctx = _extract_context_from_system(messages)
+            metrics = _basic_eval(answer_text=msg, question_text=q, context_text=ctx)
+            for k, v in metrics.items():
+                eval_span.set_attribute(k, float(v))
+    except Exception:
+        pass
+
+    # ---------- LLM-judge evaluator span (sibling) ----------
+    if _HAS_LLM_EVAL:
+        try:
+            with tracer.start_as_current_span("eval.llm") as llm_span:
+                llm_span.set_attribute("session.id", SESSION_ID)
+                q = _last_user_message(messages)
+                ctx = _extract_context_from_system(messages)
+                # If you ever have a ground truth string, pass it here:
+                gt = os.getenv("EVAL_QA_GROUND_TRUTH", None) if EVAL_QA_ENABLE else None
+                llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=gt)
+                for k, v in llm_metrics.items():
+                    # numbers set as floats; reasons as strings
+                    if isinstance(v, (int, float)):
+                        llm_span.set_attribute(k, float(v))
+                    else:
+                        llm_span.set_attribute(k, str(v))
+        except Exception:
+            pass
+
+    return msg

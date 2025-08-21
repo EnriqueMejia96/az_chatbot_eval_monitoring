@@ -7,3 +7,4 @@ azure-identity
 azure-ai-projects 
 opentelemetry-instrumentation-openai-v2 
 azure-monitor-opentelemetry
+azure-ai-evaluation
