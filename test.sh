@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 $RG       = "jemg-personal-test"
 $ACR  = "azcreu2labt01"
 $ACR_LOGIN_SERVER = az acr show -g $RG -n $ACR --query loginServer -o tsv
