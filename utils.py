@@ -2,13 +2,13 @@ import os
 import uuid
 import time
 import re
+import inspect
 import numpy as np
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 
 from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
-
 from azure.monitor.opentelemetry import configure_azure_monitor
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
@@ -33,6 +33,7 @@ os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "tru
 EVAL_CONTEXT_SIM = os.getenv("EVAL_CONTEXT_SIMILARITY", "true").lower() in ("1", "true", "yes")
 EVAL_THRESHOLD = int(os.getenv("EVAL_THRESHOLD", "3"))
 EVAL_QA_ENABLE = os.getenv("EVAL_QA_ENABLE", "false").lower() in ("1", "true", "yes")
+EVAL_SAFETY_ENABLE = os.getenv("EVAL_SAFETY_ENABLE","true").lower() in ("1", "true", "yes")
 
 # ---------- OpenTelemetry ----------
 tracer = trace.get_tracer(__name__)
@@ -114,6 +115,78 @@ except Exception:
     _coherence_eval = None
     _fluency_eval = None
     _HAS_LLM_EVAL = False
+
+# ---------- Safety/Risk evaluators (built-in) ----------
+
+_HAS_SAFETY = False
+
+_SAFETY_CLASS_BY_KEY = {
+    "code_vulnerability": "CodeVulnerabilityEvaluator",
+    "hate_speechness": "HateUtterancesEvaluator",
+    "indirect_attack": "IndirectAttackEvaluator",
+    "self_harm": "SelfHarmEvaluator",
+    "sexual": "SexualEvaluator",
+    "violence": "ViolenceEvaluator",
+}
+
+_SAFETY_ID_BY_KEY = {
+    "code_vulnerability": "azureai://built-in/evaluators/code_vulnerability",
+    "hate_speechness": "azureai://built-in/evaluators/hate_utterances",
+    "indirect_attack": "azureai://built-in/evaluators/indirect_attack",
+    "self_harm": "azureai://built-in/evaluators/self_harm",
+    "sexual": "azureai://built-in/evaluators/sexual",
+    "violence": "azureai://built-in/evaluators/violence",
+}
+
+_safety_instances = {}
+
+try:
+    import azure.ai.evaluation as _eval_mod  # for dynamic getattr
+
+    if _model_config and EVAL_SAFETY_ENABLE:
+        for key, alias_name in _SAFETY_CLASS_BY_KEY.items():
+            Ev = getattr(_eval_mod, alias_name, None)
+            if Ev:
+                try:
+                    kwargs = {"model_config": _model_config}
+                    if "threshold" in inspect.signature(Ev).parameters:
+                        kwargs["threshold"] = EVAL_THRESHOLD
+                    _safety_instances[key] = Ev(**kwargs)
+                except Exception:
+                    _safety_instances[key] = None
+        _HAS_SAFETY = any(v is not None for v in _safety_instances.values())
+except Exception:
+    _HAS_SAFETY = False
+    _safety_instances = {}
+
+
+def _safe_call_eval(ev, **kwargs):
+    try:
+        sig = inspect.signature(ev.__call__)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return ev(**filtered)
+    except Exception:
+        try:
+            sig = inspect.signature(ev)
+            filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return ev(**filtered)
+        except Exception:
+            try:
+                return ev(query=kwargs.get("query"), response=kwargs.get("response"),
+                          context=kwargs.get("context"), ground_truth=kwargs.get("ground_truth"))
+            except Exception:
+                return {}
+
+def _extract_numeric(out: dict, primary_key: str) -> float | None:
+    if not isinstance(out, dict):
+        return None
+
+    for k in (primary_key, f"{primary_key}_score", "value"):
+        if k in out and isinstance(out[k], (int, float)):
+            return float(out[k])
+
+    return None
+
 
 # ---------- Your original helpers (same API) ----------
 def text_embedding(text=[]):
@@ -306,6 +379,36 @@ def _llm_eval(question_text: str, answer_text: str, context_text: str, ground_tr
 
     return {k: v for k, v in results.items() if v is not None}
 
+# ---------- Safety/Risk evaluation (built-ins) ----------
+
+def _safety_eval(question_text: str, answer_text: str, context_text: str):
+    """Run built-in safety evaluators (if available) and return scores."""
+
+    results = {}
+    if not (_HAS_SAFETY and EVAL_SAFETY_ENABLE):
+        return results
+
+    for key, ev in _safety_instances.items():
+        if not ev:
+            continue
+
+        try:
+            out = _safe_call_eval(
+                ev,
+                query=question_text,
+                response=answer_text,
+                context=context_text or "",
+            )
+            score_key = key
+            score = _extract_numeric(out, score_key)
+            if score is not None:
+                results[f"ai.eval.safety.{key}"] = float(score)
+        except Exception:
+            continue
+
+    return results
+
+
 def get_response(model, temperature, messages):
     with tracer.start_as_current_span("chat.completions.create") as span:
         span.set_attribute("session.id", SESSION_ID)
@@ -354,29 +457,47 @@ def get_response(model, temperature, messages):
                 pass
 
             # ---- LLM-judge inside the chat span so we can emit events with this span active ----
-            llm_metrics = {}
-            if _HAS_LLM_EVAL:
+
+            # ---- LLM-judge + SAFETY inside the chat span ----
+            if _HAS_LLM_EVAL and EVAL_ATTACH_TO_CHAT:
                 try:
                     llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=None)
 
-                    # Put canonical keys on span (helps the column show values)
                     if "ai.eval.coherence" in llm_metrics:
                         span.set_attribute("coherence", float(llm_metrics["ai.eval.coherence"]))
-                        _emit_eval_event(span, "coherence", llm_metrics["ai.eval.coherence"],
-                                         model or resp_mod, resp_id)
+                        _emit_eval_event(span, "coherence", llm_metrics["ai.eval.coherence"], model or resp_mod, resp_id)
+
                     if "ai.eval.fluency" in llm_metrics:
                         span.set_attribute("fluency", float(llm_metrics["ai.eval.fluency"]))
-                        _emit_eval_event(span, "fluency", llm_metrics["ai.eval.fluency"],
-                                         model or resp_mod, resp_id)
-                    # Optional QA metrics if you enable them later
+                        _emit_eval_event(span, "fluency", llm_metrics["ai.eval.fluency"], model or resp_mod, resp_id)
+
                     if "ai.eval.qa.similarity" in llm_metrics:
                         span.set_attribute("similarity", float(llm_metrics["ai.eval.qa.similarity"]))
-                        _emit_eval_event(span, "similarity", llm_metrics["ai.eval.qa.similarity"],
-                                         model or resp_mod, resp_id)
+                        _emit_eval_event(span, "similarity", llm_metrics["ai.eval.qa.similarity"], model or resp_mod, resp_id)
+
                     if "ai.eval.qa.f1_score" in llm_metrics:
                         span.set_attribute("f1_score", float(llm_metrics["ai.eval.qa.f1_score"]))
-                        _emit_eval_event(span, "f1_score", llm_metrics["ai.eval.qa.f1_score"],
-                                         model or resp_mod, resp_id)
+                        _emit_eval_event(span, "f1_score", llm_metrics["ai.eval.qa.f1_score"], model or resp_mod, resp_id)
+
+                except Exception:
+                    pass
+
+
+            if _HAS_SAFETY and EVAL_SAFETY_ENABLE:
+                try:
+                    safety = _safety_eval(question_text=q, answer_text=msg, context_text=ctx)
+                    for key, score in safety.items():
+                        name = key.rsplit(".", 1)[-1]
+                        evaluator_id = _SAFETY_ID_BY_KEY.get(name)
+                        span.set_attribute(f"safety.{name}", float(score))
+                        _emit_eval_event(
+                            span,
+                            name,
+                            float(score),
+                            model or resp_mod,
+                            resp_id,
+                            evaluator_id=evaluator_id
+                        )
                 except Exception:
                     pass
 
@@ -385,32 +506,20 @@ def get_response(model, temperature, messages):
             span.record_exception(e)
             raise
 
-    # Sibling spans (keep, optional)
+
     try:
         with tracer.start_as_current_span("eval.metrics") as eval_span:
             eval_span.set_attribute("session.id", SESSION_ID)
+
             q = _last_user_message(messages)
             ctx = _extract_context_from_system(messages)
-            metrics = _basic_eval(answer_text=msg, question_text=q, context_text=ctx)  # includes context_similarity
+
+            metrics = _basic_eval(answer_text=msg, question_text=q, context_text=ctx)
             for k, v in metrics.items():
                 eval_span.set_attribute(k, float(v))
+
     except Exception:
         pass
-
-    if _HAS_LLM_EVAL:
-        try:
-            with tracer.start_as_current_span("eval.llm") as llm_span:
-                llm_span.set_attribute("session.id", SESSION_ID)
-                q = _last_user_message(messages)
-                ctx = _extract_context_from_system(messages)
-                llm_metrics = _llm_eval(question_text=q, answer_text=msg, context_text=ctx, ground_truth=None)
-                for k, v in llm_metrics.items():
-                    if isinstance(v, (int, float)):
-                        llm_span.set_attribute(k, float(v))
-                    else:
-                        llm_span.set_attribute(k, str(v))
-        except Exception:
-            pass
 
     return msg
 
