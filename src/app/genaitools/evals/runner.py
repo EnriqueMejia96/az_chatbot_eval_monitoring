@@ -5,7 +5,6 @@ import inspect
 from typing import Any, Dict, Iterable, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from app.genaitools.config import settings
 from azure.identity import DefaultAzureCredential
 
 # https://learn.microsoft.com/en-us/python/api/azure-ai-evaluation/azure.ai.evaluation
@@ -49,6 +48,9 @@ def set_eval_env_vars(
     resource_group: Optional[str] = None,
     project_name: Optional[str] = None,
     project_url: Optional[str] = None,
+    # Eval parameters
+    eval_threshold: Optional[str] = None,
+
 ) -> None:
 
     if judge_endpoint:
@@ -68,6 +70,10 @@ def set_eval_env_vars(
         os.environ["AZURE_PROJECT_NAME"] = project_name
     if project_url:
         os.environ["PROJECT_ENDPOINT"] = project_url
+    
+    if eval_threshold:
+        os.environ["EVAL_THRESHOLD"] = eval_threshold
+    
 
 def _normalize(name: str) -> str:
     return name.strip().lower().replace("-", "_").replace(" ", "_")
@@ -166,8 +172,6 @@ def _get_evaluator(
     if key not in EVAL_REGISTRY:
         raise ValueError(f"Unknown evaluator '{name}'. Known: {', '.join(sorted(EVAL_REGISTRY))}")
 
-    used_threshold = threshold if threshold is not None else settings.eval_threshold
-
     cls = EVAL_REGISTRY[key]
     _model_config = AzureOpenAIModelConfiguration(
         azure_endpoint=os.getenv("AZURE_JUDGE_ENDPOINT"),
@@ -175,10 +179,10 @@ def _get_evaluator(
         azure_deployment=os.getenv("AZURE_JUDGE_DEPLOYMENT_NAME"),
         api_version=os.getenv("AZURE_JUDGE_API_VERSION", "2024-10-21"),
     )
-    ctor_kwargs = _build_kwargs_for_constructor(cls, used_threshold, _model_config, ctor_overrides)
+    ctor_kwargs = _build_kwargs_for_constructor(cls, threshold, _model_config, ctor_overrides)
 
     uses_secret_bits = any(k in ctor_kwargs for k in ("credential", "azure_ai_project"))
-    cache_key = (key, used_threshold) if not uses_secret_bits else None
+    cache_key = (key, threshold) if not uses_secret_bits else None
 
     if cache_key and cache_key in _EVAL_CACHE:
         return _EVAL_CACHE[cache_key]
@@ -239,7 +243,7 @@ def run_evaluator(
     **extra_kwargs: Any,
 ) -> Dict[str, Any]:
     key = _normalize(evaluator)
-    if key == "qa" and (not settings.eval_qa_enable or not ground_truth):
+    if key == "qa" and (not ground_truth):
         return {"__skipped__": True, "__reason__": "QA disabled or missing ground_truth"}
 
     ev = _get_evaluator(evaluator, threshold=threshold, ctor_overrides=ctor_overrides)
@@ -291,7 +295,7 @@ def run_evaluators(
     def _one(raw_name: str) -> tuple[str, Dict[str, Any]]:
         name = _normalize(raw_name)
         try:
-            if name == "qa" and (not settings.eval_qa_enable or not common.get("ground_truth")):
+            if name == "qa" and (not common.get("ground_truth")):
                 return name, {"__skipped__": True, "__reason__": "QA disabled or missing ground_truth"}
 
             merged_ctor: Dict[str, Any] = {}
