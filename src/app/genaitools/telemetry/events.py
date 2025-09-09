@@ -2,7 +2,6 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Literal
 from numbers import Number
 
-# Built-in safety evaluator IDs (needed for your KQL filter)
 SAFETY_IDS = {
     "indirect_attack":    "azureai://built-in/evaluators/indirect_attack",
     "violence":           "azureai://built-in/evaluators/violence",
@@ -12,7 +11,6 @@ SAFETY_IDS = {
     "code_vulnerability": "azureai://built-in/evaluators/code_vulnerability",
 }
 
-# Preferred numeric keys and “reason” fields per evaluator
 PRIMARY_SCORE_KEYS = {
     # quality
     "coherence": ["coherence", "gpt_coherence"],
@@ -26,13 +24,13 @@ PRIMARY_SCORE_KEYS = {
     "f1":        ["f1", "f1_score"],
     "retrieval": ["retrieval", "retrieval_score", "f1_score", "precision", "recall", "similarity"],
 
-    # safety (these often return a numeric score; if not, we’ll fall back to *_label → 0/1)
+    # safety
     "violence":  ["violence", "score", "value"],
     "sexual":    ["sexual", "score", "value"],
     "self_harm": ["self_harm", "score", "value"],
     "hate_unfairness": ["hate_unfairness", "score", "value"],
     "code_vulnerability": ["code_vulnerability", "score", "value"],
-    # indirect_attack handled specially (XPIA booleans)
+    # indirect_attack handled specially
 }
 
 REASON_KEYS = {
@@ -66,13 +64,11 @@ def _first_numeric(d: Dict[str, Any], keys: list[str]) -> Optional[float]:
             v = _as_float_boolaware(d[k])
             if v is not None:
                 return v
-    # generic fallbacks
     for k in ("score", "value"):
         if k in d:
             v = _as_float_boolaware(d[k])
             if v is not None:
                 return v
-    # last resort: first numeric in dict
     for v in d.values():
         fv = _as_float_boolaware(v)
         if fv is not None:
@@ -80,7 +76,6 @@ def _first_numeric(d: Dict[str, Any], keys: list[str]) -> Optional[float]:
     return None
 
 def _score_for_rouge(res: Dict[str, Any]) -> Optional[float]:
-    # Prefer rougeL_f1, then rouge1_f1, rouge2_f1, rougeLsum_f1; else average any *_f1 present
     pref = ("rougeL_f1", "rouge1_f1", "rouge2_f1", "rougeLsum_f1")
     s = _first_numeric(res, list(pref))
     if s is not None:
@@ -89,7 +84,6 @@ def _score_for_rouge(res: Dict[str, Any]) -> Optional[float]:
     return float(sum(f1s) / len(f1s)) if f1s else None
 
 def _extract_indirect_attack(res: Dict[str, Any]) -> tuple[float, Dict[str, Any], Optional[str]]:
-    # XPIA: booleans -> score, plus sub-flags as extra attrs
     label = res.get("xpia_label")
     if isinstance(label, bool):
         score = 1.0 if label else 0.0
@@ -112,11 +106,11 @@ def _extract_indirect_attack(res: Dict[str, Any]) -> tuple[float, Dict[str, Any]
 def emit_eval_event(
     active_span,
     *,
-    evaluator: str,                 # "coherence", "fluency", "relevance", "indirect_attack", ...
-    result: Any,                    # dict from SDK OR a numeric/bool score
+    evaluator: str,                 
+    result: Any,                    
     model: str,
     response_id: str,
-    numeric_key: Optional[str] = None,  # optional override for which dict key to use as score
+    numeric_key: Optional[str] = None,  
 ) -> Optional[float]:
     """
     Auto-detects score + extra attrs from the evaluator result and emits a
@@ -128,33 +122,27 @@ def emit_eval_event(
     is_safety = ev in SAFETY_IDS
     evaluator_id = SAFETY_IDS.get(ev)
 
-    # --- extract score + explanation + extra_attrs ---
     score: Optional[float] = None
     explanation: Optional[str] = None
     extra_attrs: Dict[str, Any] = {}
 
     if isinstance(result, dict):
-        # special cases
         if ev == "rouge":
             score = _score_for_rouge(result)
         elif ev == "indirect_attack":
             score, extra_attrs, explanation = _extract_indirect_attack(result)
         else:
-            # try explicit override, then known keys
             if numeric_key:
                 score = _first_numeric(result, [numeric_key])
             if score is None:
                 score = _first_numeric(result, PRIMARY_SCORE_KEYS.get(ev, []))
-            # explanation “reason”
             rk = REASON_KEYS.get(ev)
             if rk:
                 explanation = result.get(rk)
     else:
-        # numeric/bool provided directly
         score = _as_float_boolaware(result)
 
     if score is None:
-        # Don’t emit if we cannot produce a numeric score
         try:
             active_span.add_event("gen_ai.evaluation.missing_score", attributes={
                 "gen_ai.evaluator.name": ev,
@@ -165,7 +153,6 @@ def emit_eval_event(
             pass
         return None
 
-    # --- build event attrs ---
     attrs: Dict[str, Any] = {
         "gen_ai.evaluator.name": ev,
         "gen_ai.evaluation.score": float(score),
@@ -177,18 +164,9 @@ def emit_eval_event(
         attrs["gen_ai.evaluator.id"] = evaluator_id
     if explanation:
         attrs["gen_ai.evaluation.explanation"] = str(explanation)
-    # attach extra attrs (e.g., XPIA sub-flags)
     for k, v in (extra_attrs or {}).items():
         if v is not None:
             attrs[f"gen_ai.evaluation.{ev}.{k}"] = v
-
-    # mirror handy span attributes (optional, helps ad-hoc KQL)
-    # prefix = "safety" if is_safety else "quality"
-    # active_span.set_attribute(f"{prefix}.{ev}.score", float(score))
-    # if explanation:
-    #     active_span.set_attribute(f"{prefix}.{ev}.explanation", str(explanation))
-    # if evaluator_id:
-    #     active_span.set_attribute(f"{prefix}.{ev}.id", evaluator_id)
 
     try:
         active_span.add_event(event_name, attributes=attrs)

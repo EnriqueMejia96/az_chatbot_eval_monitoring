@@ -1,9 +1,17 @@
-from app.genaitools.telemetry.otel import chat_client
+from app.genaitools.telemetry.otel import make_openai_client
 import numpy as np
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+openai_client = make_openai_client(
+    project_endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT"),
+    api_version = "2024-10-21"
+    )
 
 # ---- Embeddings ----
 def text_embedding(input, model):
-    resp = chat_client.embeddings.create(
+    resp = openai_client.embeddings.create(
         model=model,
         input=input,
         encoding_format="float",
@@ -32,7 +40,6 @@ def get_context_from_query(prompt_emb, vector_store, n_chunks=5):
     return chunks, n_chunks
 
 # ---- Chat response ----
-
 custom_prompt = """
 Eres una Inteligencia Artificial super avanzada que trabaja asistente personal.
 Utilice los RESULTADOS DE BÚSQUEDA SEMANTICA para responder las preguntas del usuario. 
@@ -65,7 +72,7 @@ def get_response(model, temperature, rag_context, prompt, history):
         + history
         + [{"role": "user", "content": prompt}]
     )
-    completion = chat_client.chat.completions.create(model=model, temperature=temperature, messages=messages)
+    completion = openai_client.chat.completions.create(model=model, temperature=temperature, messages=messages)
     input_tokens, output_tokens, total_tokens = extract_usage(completion)
 
     msg = completion.choices[0].message.content

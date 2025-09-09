@@ -1,27 +1,33 @@
 import streamlit as st
 import pandas as pd
-from app.utils import get_context_from_query, get_response, text_embedding
-from opentelemetry.trace import Status, StatusCode
-from app.genaitools.telemetry.otel import tracer, SESSION_ID, server_host
-from app.genaitools.telemetry.events import emit_eval_event, set_genai_span_attrs
 import time
 import os
-from dataclasses import dataclass
-from dotenv import load_dotenv
+from opentelemetry.trace import Status, StatusCode
+from app.utils import get_context_from_query, get_response, text_embedding
+from app.genaitools.telemetry.otel import init_telemetry
+from app.genaitools.telemetry.events import emit_eval_event, set_genai_span_attrs
+from app.genaitools.evals.runner import set_eval_env_vars, run_evaluators
 
+from dotenv import load_dotenv
 load_dotenv()
 
-@dataclass(frozen=True)
-class Settings:
-    project_endpoint: str = os.environ["PROJECT_ENDPOINT"]
-    embedding_deployment: str = os.environ["EMBEDDING_DEPLOYMENT"]
-    eval_attach_to_chat: bool = os.getenv("EVAL_ATTACH_TO_CHAT", "true").lower() in ("1","true","yes")
-    eval_context_sim:    bool = os.getenv("EVAL_CONTEXT_SIMILARITY","true").lower() in ("1","true","yes")
-    eval_threshold:      int  = int(os.getenv("EVAL_THRESHOLD","3"))
-    eval_qa_enable:      bool = os.getenv("EVAL_QA_ENABLE","false").lower() in ("1","true","yes")
-    eval_safety_enable:  bool = os.getenv("EVAL_SAFETY_ENABLE","true").lower() in ("1","true","yes")
+tracer, session_id, server_host = init_telemetry(
+                                    project_endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT"),
+                                    service_name = os.getenv("OTEL_SERVICE_NAME"),              
+                                    capture_message_content = os.getenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true").lower() in ("1", "true", "yes"), 
+                                    trace_to_console = os.getenv("OTEL_TRACE_TO_CONSOLE", "false").lower() in ("1", "true", "yes")
+                                    )
 
-settings = Settings()
+set_eval_env_vars(
+    judge_endpoint = os.getenv("AZURE_JUDGE_ENDPOINT"),
+    judge_api_key= os.getenv("AZURE_JUDGE_API_KEY"),
+    judge_deployment= os.getenv("AZURE_JUDGE_DEPLOYMENT_NAME"),
+    judge_api_version= os.getenv("AZURE_JUDGE_API_VERSION"),
+    subscription_id= os.getenv("AZURE_SUBSCRIPTION_ID"),
+    resource_group= os.getenv("AZURE_RESOURCE_GROUP_NAME"),
+    project_name= os.getenv("AZURE_PROJECT_NAME"),
+    project_url= os.getenv("PROJECT_ENDPOINT")
+)
 
 df_vector_store = pd.read_pickle('df_vector_store.pkl')
 
@@ -62,21 +68,21 @@ def main_page():
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             with tracer.start_as_current_span("testlab") as root:
-                root.set_attribute("session.id", SESSION_ID)
-                root.set_attribute("gen_ai.use_case", "rag_qa")
+                root.set_attribute("session.id", session_id)
+                root.set_attribute("gen_ai.use_case", "chatbot_test")
 
                 with tracer.start_as_current_span("operation.embedding") as span_embedding:
                     try:
                         t_embedding = time.time()
                         prompt_emb, embedding_dimension, input_tokens, total_tokens = text_embedding(input = prompt,
-                                                                                                    model = settings.embedding_deployment)
+                                                                                                    model = os.environ["EMBEDDING_DEPLOYMENT"])
                         set_genai_span_attrs(
                             span = span_embedding,
                             server_host=server_host,
-                            session_id=SESSION_ID,
+                            session_id=session_id,
                             service = 'openai',
                             operation = 'embedding',
-                            model=settings.embedding_deployment,                 
+                            model=os.environ["EMBEDDING_DEPLOYMENT"],                 
                             latency_ms = int((time.time()-t_embedding)*1000),
                             embedding_dimension = embedding_dimension,
                             input_tokens=input_tokens,
@@ -95,7 +101,7 @@ def main_page():
                         set_genai_span_attrs(
                             span = span_rag,
                             server_host=server_host,
-                            session_id=SESSION_ID,
+                            session_id=session_id,
                             service = 'custom_rag',
                             operation = 'rag',
                             latency_ms = int((time.time()-t_rag)*1000),
@@ -120,7 +126,7 @@ def main_page():
                         set_genai_span_attrs(
                             span = span_chat,
                             server_host=server_host,
-                            session_id=SESSION_ID,
+                            session_id=session_id,
                             service = 'openai',
                             operation = 'chat',
                             model=st.session_state.model,                 
@@ -131,7 +137,6 @@ def main_page():
                             latency_ms = int((time.time()-t_chat)*1000)
                         )
 
-                        from app.genaitools.evals.runner import run_evaluators
                         evaluators = ["coherence", "fluency", "relevance", "indirect_attack"]
                         outs = run_evaluators(
                             evaluators = evaluators,
