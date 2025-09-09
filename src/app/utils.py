@@ -1,4 +1,4 @@
-from app.genaitools.telemetry.otel import make_openai_client
+from genaitoolkit.telemetry.otel import make_openai_client
 import numpy as np
 from dotenv import load_dotenv
 import os

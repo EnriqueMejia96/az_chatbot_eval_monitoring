@@ -3,8 +3,5 @@ pandas
 numpy
 python-dotenv
 openai 
-azure-identity 
-azure-ai-projects 
-opentelemetry-instrumentation-openai-v2 
-azure-monitor-opentelemetry
-azure-ai-evaluation
+genai-toolkit @ git+https://github.com/EnriqueMejia96/genai-toolkit.git@v0.1.0
+

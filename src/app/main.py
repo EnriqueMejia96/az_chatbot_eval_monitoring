@@ -4,9 +4,9 @@ import time
 import os
 from opentelemetry.trace import Status, StatusCode
 from app.utils import get_context_from_query, get_response, text_embedding
-from app.genaitools.telemetry.otel import init_telemetry
-from app.genaitools.telemetry.events import emit_eval_event, set_genai_span_attrs
-from app.genaitools.evals.runner import set_eval_env_vars, run_evaluators
+from genaitoolkit.telemetry.otel import init_telemetry
+from genaitoolkit.telemetry.events import emit_eval_event, set_genai_span_attrs
+from genaitoolkit.evals.runner import set_eval_env_vars, run_evaluators
 
 from dotenv import load_dotenv
 load_dotenv()
