@@ -1,0 +1,5 @@
+# Ignore Python cache folders everywhere
+**/__pycache__/
+
+# Ignore all .env files
+*.env
