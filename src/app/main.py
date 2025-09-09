@@ -1,7 +1,27 @@
 import streamlit as st
 import pandas as pd
-from app.utils import get_context_from_query, custom_prompt, get_response
-from app.genaitools.telemetry.otel import tracer, SESSION_ID
+from app.utils import get_context_from_query, get_response, text_embedding
+from opentelemetry.trace import Status, StatusCode
+from app.genaitools.telemetry.otel import tracer, SESSION_ID, server_host
+from app.genaitools.telemetry.events import emit_eval_event, set_genai_span_attrs
+import time
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
+
+@dataclass(frozen=True)
+class Settings:
+    project_endpoint: str = os.environ["PROJECT_ENDPOINT"]
+    embedding_deployment: str = os.environ["EMBEDDING_DEPLOYMENT"]
+    eval_attach_to_chat: bool = os.getenv("EVAL_ATTACH_TO_CHAT", "true").lower() in ("1","true","yes")
+    eval_context_sim:    bool = os.getenv("EVAL_CONTEXT_SIMILARITY","true").lower() in ("1","true","yes")
+    eval_threshold:      int  = int(os.getenv("EVAL_THRESHOLD","3"))
+    eval_qa_enable:      bool = os.getenv("EVAL_QA_ENABLE","false").lower() in ("1","true","yes")
+    eval_safety_enable:  bool = os.getenv("EVAL_SAFETY_ENABLE","true").lower() in ("1","true","yes")
+
+settings = Settings()
 
 df_vector_store = pd.read_pickle('df_vector_store.pkl')
 
@@ -41,21 +61,102 @@ def main_page():
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            with tracer.start_as_current_span("rag.qa") as root:
+            with tracer.start_as_current_span("testlab") as root:
                 root.set_attribute("session.id", SESSION_ID)
                 root.set_attribute("gen_ai.use_case", "rag_qa")
 
-                Context_List = get_context_from_query(prompt, df_vector_store, n_chunks=5)
-                messages = (
-                    [{"role": "system", "content": f"{custom_prompt.format(source=str(Context_List))}"}]
-                    + st.session_state.message_history
-                    + [{"role": "user", "content": prompt}]
-                )
-                full_response = get_response(
-                    model=st.session_state.model,
-                    temperature=st.session_state.temperature,
-                    messages=messages
-                )
+                with tracer.start_as_current_span("operation.embedding") as span_embedding:
+                    try:
+                        t_embedding = time.time()
+                        prompt_emb, embedding_dimension, input_tokens, total_tokens = text_embedding(input = prompt,
+                                                                                                    model = settings.embedding_deployment)
+                        set_genai_span_attrs(
+                            span = span_embedding,
+                            server_host=server_host,
+                            session_id=SESSION_ID,
+                            service = 'openai',
+                            operation = 'embedding',
+                            model=settings.embedding_deployment,                 
+                            latency_ms = int((time.time()-t_embedding)*1000),
+                            embedding_dimension = embedding_dimension,
+                            input_tokens=input_tokens,
+                            total_tokens=total_tokens
+                        )
+                    except Exception as e:
+                        span_embedding.set_status(Status(StatusCode.ERROR, str(e)))
+                        span_embedding.record_exception(e)
+                        raise
+
+                with tracer.start_as_current_span("operation.rag") as span_rag:
+                    try:
+                        t_rag = time.time()
+                        rag_context , n_chunks= get_context_from_query(prompt_emb, df_vector_store, n_chunks=5)
+
+                        set_genai_span_attrs(
+                            span = span_rag,
+                            server_host=server_host,
+                            session_id=SESSION_ID,
+                            service = 'custom_rag',
+                            operation = 'rag',
+                            latency_ms = int((time.time()-t_rag)*1000),
+                            n_chunks = n_chunks,
+                        )
+
+                    except Exception as e:
+                        span_rag.set_status(Status(StatusCode.ERROR, str(e)))
+                        span_rag.record_exception(e)
+                        raise
+
+                with tracer.start_as_current_span("operation.chat.principal") as span_chat:
+                    try:
+                        t_chat = time.time()
+                        full_response, input_tokens, output_tokens, total_tokens, resp_id = get_response(
+                                                                                                model=st.session_state.model,
+                                                                                                temperature=st.session_state.temperature,
+                                                                                                rag_context=rag_context, 
+                                                                                                prompt=prompt, 
+                                                                                                history=st.session_state.message_history
+                                                                                            )
+                        set_genai_span_attrs(
+                            span = span_chat,
+                            server_host=server_host,
+                            session_id=SESSION_ID,
+                            service = 'openai',
+                            operation = 'chat',
+                            model=st.session_state.model,                 
+                            temperature=st.session_state.temperature,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            latency_ms = int((time.time()-t_chat)*1000)
+                        )
+
+                        from app.genaitools.evals.runner import run_evaluators
+                        evaluators = ["coherence", "fluency", "relevance", "indirect_attack"]
+                        outs = run_evaluators(
+                            evaluators = evaluators,
+                            query=prompt,
+                            response=full_response
+                        )
+                        print(str(outs))
+
+                        for name, res in outs.items():
+                            if "__error__" in res or "__skipped__" in res:
+                                span_chat.add_event("gen_ai.evaluation.error", {"evaluator": name, "message": str(res)})
+                                continue
+                            emit_eval_event(
+                                active_span=span_chat,
+                                evaluator=name,
+                                result=res,
+                                model=st.session_state.model,
+                                response_id=resp_id
+                            )
+
+                    except Exception as e:
+                        span_chat.set_status(Status(StatusCode.ERROR, str(e)))
+                        span_chat.record_exception(e)
+                        raise
+
             message_placeholder.markdown(full_response)
 
         st.session_state.message_history += [

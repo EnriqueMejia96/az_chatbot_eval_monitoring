@@ -5,7 +5,7 @@ from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
 from azure.monitor.opentelemetry import configure_azure_monitor
 from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
-from . import __init__  # keep package import happy
+from . import __init__
 from app.genaitools.config import settings
 
 # friendly service name + content capture
